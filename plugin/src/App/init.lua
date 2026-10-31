@@ -154,6 +154,8 @@ function App:init()
 				self:checkSyncReminder()
 			end
 		end)
+
+		self:startReconnectRequestListener()
 	end
 
 	if self:isAutoConnectPlaytestServerAvailable() then
@@ -189,6 +191,10 @@ function App:willUnmount()
 
 	self.autoConnectPlaytestServerListener()
 	self:clearRunningConnectionInfo()
+	self.reconnectToken = nil
+	if self.reconnectRequestConnection then
+		self.reconnectRequestConnection:Disconnect()
+	end
 end
 
 function App:addNotification(notif: {
@@ -384,6 +390,56 @@ function App:releaseSyncLock()
 	end
 
 	Log.trace("Could not relase sync lock because it is owned by {}", lock.Value)
+end
+
+-- Fork (studio-mcp-reconnect): keep reconnecting after an error disconnect (e.g. `rojo serve` restarted, or the
+-- websocket dropped while many files changed), as long as "Auto Reconnect" is on and nobody ended the session by
+-- hand. Each attempt is `tryAutoReconnect`, so it only reconnects to the same project.
+local RECONNECT_INTERVAL = 3
+
+function App:scheduleReconnect()
+	if not RunService:IsEdit() or not Settings:get("autoReconnect") or self.reconnectToken ~= nil then
+		return
+	end
+	local token = {}
+	self.reconnectToken = token
+	task.spawn(function()
+		while self.reconnectToken == token and self.serveSession == nil and Settings:get("autoReconnect") do
+			task.wait(RECONNECT_INTERVAL)
+			if self.reconnectToken ~= token or self.serveSession ~= nil then
+				break
+			end
+			local ok, didReconnect = self:tryAutoReconnect():await()
+			if ok and didReconnect then
+				break
+			end
+		end
+		if self.reconnectToken == token then
+			self.reconnectToken = nil
+		end
+	end)
+end
+
+-- Fork (studio-mcp-reconnect): a reconnect that tools can request without clicking. Creating any instance named
+-- `RojoReconnectRequest` in CoreGui (never saved with the place; plugin code such as the Studio MCP's
+-- `execute_luau` can do it) disconnects and connects again, which also re-adopts instances replaced outside Rojo.
+local RECONNECT_REQUEST = "RojoReconnectRequest"
+
+function App:startReconnectRequestListener()
+	local CoreGui = game:GetService("CoreGui")
+	local function handle(child: Instance)
+		if child.Name ~= RECONNECT_REQUEST then
+			return
+		end
+		task.defer(child.Destroy, child)
+		Log.info("Reconnect requested through {}", RECONNECT_REQUEST)
+		self:addNotification({
+			text = "Reconnect requested: resyncing...",
+		})
+		self:endSession()
+		self:startSession()
+	end
+	self.reconnectRequestConnection = CoreGui.ChildAdded:Connect(handle)
 end
 
 function App:findActiveServer()
@@ -715,6 +771,7 @@ function App:startSession()
 			-- disconnection was from an error.
 			if details ~= nil then
 				Log.warn("Disconnected from an error: {}", details)
+				self:scheduleReconnect()
 
 				self:setState({
 					appStatus = AppStatus.Error,
@@ -830,6 +887,8 @@ function App:startSession()
 end
 
 function App:endSession()
+	-- Ending a session by hand also stops any pending reconnect attempts.
+	self.reconnectToken = nil
 	if self.serveSession == nil then
 		return
 	end
